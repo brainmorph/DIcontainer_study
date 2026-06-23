@@ -1,0 +1,408 @@
+================================================================================
+DI CONTAINER FRAMEWORK — IMPLEMENTATION PLAN OUTLINE
+Target: .NET 8.0 | No third-party libraries
+================================================================================
+
+CONFIRMED DESIGN DECISIONS
+---------------------------
+- Lifetimes:          Singleton, Transient, Scoped
+- API style:          Inspired by MS DI, but our own naming and structure
+- Injection:          Constructor injection + Property injection via [Inject] attribute
+                      + Factory delegate registration
+- Advanced features:  Circular dependency detection
+                      IEnumerable<T> multi-registration resolution
+                      IDisposable instance tracking and cleanup
+                      Captive dependency guard (Scoped from root throws)
+- Constructor pick:   Greedy — constructor with the most parameters wins
+- Thread safety:      None — single-threaded use only
+
+
+================================================================================
+SECTION 1 — CORE VALUE TYPES
+================================================================================
+
+ServiceLifetime  (enum)
+  Singleton  — one instance shared for the lifetime of the container
+  Transient  — new instance on every resolution call
+  Scoped     — one instance per explicit scope
+
+ServiceDescriptor  (class, immutable after construction)
+  Purpose: a single record describing how to build one service.
+
+  Properties:
+    Type            ServiceType              — the abstraction (e.g. IFoo)
+    Type?           ImplementationType       — concrete class, instantiated via reflection
+    ServiceLifetime Lifetime
+    Func<IContainer, object>? Factory       — delegate-based creation (our name: IContainer)
+    object?         Instance                — pre-built singleton; implies Singleton lifetime
+
+  Invariants to enforce in the constructor:
+    - Exactly one of ImplementationType, Factory, or Instance must be non-null.
+    - If Instance is provided, Lifetime must be Singleton.
+
+  Static factory helpers (for readable call sites):
+    ServiceDescriptor.Singleton<TService, TImpl>()
+    ServiceDescriptor.Singleton<TService>(TService instance)
+    ServiceDescriptor.Singleton<TService>(Func<IContainer, TService> factory)
+    ServiceDescriptor.Transient<TService, TImpl>()
+    ServiceDescriptor.Transient<TService>(Func<IContainer, TService> factory)
+    ServiceDescriptor.Scoped<TService, TImpl>()
+    ServiceDescriptor.Scoped<TService>(Func<IContainer, TService> factory)
+
+
+================================================================================
+SECTION 2 — ABSTRACTIONS (Interfaces)
+================================================================================
+
+IServiceRegistry  (extends IList<ServiceDescriptor>)
+  No extra members. Exists to give extension methods a stable target type.
+  BuildContainer() is an extension method that returns an IContainer.
+
+IContainer  (our equivalent of IServiceProvider — do NOT reuse System.IServiceProvider)
+  object? Resolve(Type serviceType)
+  Note: also expose typed extension methods via ContainerExtensions (Section 5).
+
+IContainerScope  (our equivalent of IServiceScope)
+  IContainer Container { get; }
+  Implements IDisposable
+
+IScopeFactory  (our equivalent of IServiceScopeFactory)
+  IContainerScope CreateScope()
+
+
+================================================================================
+SECTION 3 — ATTRIBUTES
+================================================================================
+
+[Inject]  (custom attribute, inherits from Attribute)
+  Targets: Property
+  Used to mark public properties for injection after construction.
+  A property marked [Inject] must have a public setter.
+
+
+================================================================================
+SECTION 4 — REGISTRATION
+================================================================================
+
+ServiceRegistry  (implements IServiceRegistry, extends List<ServiceDescriptor>)
+  No logic beyond List<ServiceDescriptor>.
+  The BuildContainer() extension method (see below) lives outside this class.
+
+ServiceRegistryExtensions  (static class)
+  All methods return IServiceRegistry for fluent chaining.
+
+  Singleton overloads:
+    AddSingleton<TService, TImpl>()
+    AddSingleton<TService>()                            — self-registration
+    AddSingleton<TService>(TService instance)           — pre-built instance
+    AddSingleton<TService>(Func<IContainer,TService>)   — factory delegate
+
+  Transient overloads:
+    AddTransient<TService, TImpl>()
+    AddTransient<TService>()
+    AddTransient<TService>(Func<IContainer,TService>)
+
+  Scoped overloads:
+    AddScoped<TService, TImpl>()
+    AddScoped<TService>()
+    AddScoped<TService>(Func<IContainer,TService>)
+
+  Builder:
+    BuildContainer(this IServiceRegistry) → IContainer
+      Constructs and returns a new Container(registry).
+
+  All overloads build a ServiceDescriptor and call registry.Add().
+
+
+================================================================================
+SECTION 5 — RESOLUTION ENGINE
+================================================================================
+
+--- 5a. Container (root, implements IContainer, IScopeFactory, IDisposable) ---
+
+  Constructor:
+    Accepts IEnumerable<ServiceDescriptor>.
+    Builds internal map: Dictionary<Type, List<ServiceDescriptor>>
+      (List because the same ServiceType can be registered more than once.)
+    Initializes singleton cache:   Dictionary<Type, object>
+    Initializes disposables list:  List<IDisposable>
+    Self-registers: adds itself under both IContainer and IScopeFactory.
+
+  Resolve(Type serviceType) — primary resolution entry point:
+    1. If serviceType == typeof(IContainer)    → return this
+    2. If serviceType == typeof(IScopeFactory) → return this
+    3. If serviceType is IEnumerable<T>        → resolve all descriptors for T,
+                                                  return as T[]  (see 5c)
+    4. Look up last registered descriptor for serviceType (last-wins).
+    5. If no descriptor found → return null.
+    6. Delegate to ResolveDescriptor(descriptor, resolutionStack: new HashSet<Type>)
+
+  ResolveDescriptor(ServiceDescriptor desc, HashSet<Type> stack) → object:
+    Singleton:
+      Check singleton cache. If hit → return cached value.
+      Otherwise → Instantiate(desc, stack), store in cache, return.
+    Transient:
+      Always → Instantiate(desc, stack). Do not cache.
+    Scoped (when called on root Container):
+      Throw InvalidOperationException:
+        "Cannot resolve scoped service '{serviceType}' from the root container.
+         Use CreateScope() to obtain a scoped container."
+
+  Instantiate(ServiceDescriptor desc, HashSet<Type> stack) → object:
+    Priority order:
+      1. desc.Instance is set         → return it directly (no injection needed)
+      2. desc.Factory is set          → invoke factory(this); then do property injection
+      3. desc.ImplementationType set  → use constructor + property injection (see 5b)
+    After creation, if object implements IDisposable → add to disposables list.
+
+  CreateScope() → IContainerScope  (from IScopeFactory):
+    Returns new ContainerScope(this).
+
+  Dispose():
+    Iterate disposables list in reverse order, call Dispose() on each.
+    Clear singleton cache and disposables list.
+    Set a disposed flag; throw ObjectDisposedException on subsequent Resolve calls.
+
+
+--- 5b. Reflection-based instantiation ---
+
+  ConstructorInject(Type implType, HashSet<Type> stack) → object:
+    a. Get all public constructors via Type.GetConstructors().
+    b. If none → throw InvalidOperationException("No public constructor on {implType}.")
+    c. Sort by parameter count descending; take the first (greedy).
+    d. Circular dependency check:
+         If implType is already in stack →
+           throw InvalidOperationException(
+             "Circular dependency detected: {implType} depends on itself.")
+         Else → stack.Add(implType)
+    e. For each constructor parameter:
+         resolved = Resolve(paramType) using the current stack
+         If resolved is null →
+           throw InvalidOperationException(
+             "Cannot resolve constructor parameter '{paramName}' of type '{paramType}'
+              for '{implType}'.")
+    f. stack.Remove(implType)
+    g. Return Activator.CreateInstance(implType, resolvedArgs[])
+
+  PropertyInject(object instance, HashSet<Type> stack):
+    a. Get all public properties on instance.GetType() where:
+         - Has [Inject] attribute
+         - Has a public setter
+    b. For each such property:
+         resolved = Resolve(property.PropertyType) using the current stack
+         If resolved is null →
+           throw InvalidOperationException(
+             "Cannot resolve [Inject] property '{propName}' of type '{propType}'
+              on '{implType}'.")
+         property.SetValue(instance, resolved)
+
+  Combined factory for ImplementationType:
+    obj = ConstructorInject(implType, stack)
+    PropertyInject(obj, stack)
+    return obj
+
+
+--- 5c. IEnumerable<T> resolution ---
+
+  When Resolve receives a type of IEnumerable<T>:
+    Look up all descriptors registered under T (not just the last one).
+    For each descriptor, call ResolveDescriptor (or retrieve from singleton cache).
+    Collect results and return as a T[] (which satisfies IEnumerable<T>).
+
+
+--- 5d. ScopedContainer (implements IContainer, IDisposable) ---
+
+  Purpose: wraps the root Container; adds its own cache for Scoped instances.
+
+  Constructor:
+    Accepts root Container (stored as internal reference, NOT exposed publicly).
+    Initializes scoped cache:      Dictionary<Type, object>
+    Initializes scoped disposables: List<IDisposable>
+    Disposed flag: false.
+
+  Resolve(Type serviceType):
+    1. If serviceType == typeof(IContainer)    → return this (scoped container)
+    2. If serviceType == typeof(IScopeFactory) → return root.CreateScope factory
+    3. If serviceType is IEnumerable<T>        → delegate to root's multi-resolve,
+                                                  but Scoped instances use this scope's cache
+    4. Look up last descriptor via root's internal descriptor map.
+    5. If not found → return null.
+    6. Lifetime == Singleton  → delegate entirely to root (it owns the singleton cache)
+    7. Lifetime == Transient  → create via root's Instantiate; if IDisposable,
+                                  add to scoped disposables (not root)
+    8. Lifetime == Scoped     → check scoped cache; if hit return it.
+                                  Otherwise create via root's Instantiate,
+                                  store in scoped cache, track IDisposable.
+
+  Dispose():
+    Dispose all scoped disposables in reverse order.
+    Clear scoped cache.
+    Set disposed flag; throw ObjectDisposedException on subsequent Resolve calls.
+
+
+--- 5e. ContainerScope (implements IContainerScope, IDisposable) ---
+
+  Properties:
+    IContainer Container  →  the ScopedContainer for this scope
+
+  Constructor:
+    Creates new ScopedContainer(rootContainer) and assigns to Container.
+
+  Dispose():
+    Calls Dispose() on the ScopedContainer.
+
+
+================================================================================
+SECTION 6 — RESOLUTION HELPERS
+================================================================================
+
+ContainerExtensions  (static class, extension methods on IContainer)
+
+  T? Resolve<T>()
+    → (T?) container.Resolve(typeof(T))
+
+  object ResolveRequired(Type serviceType)
+    → result = Resolve(serviceType)
+       if null → throw InvalidOperationException(
+                   "No registration found for '{serviceType}'.")
+       return result
+
+  T ResolveRequired<T>()
+    → (T) ResolveRequired(typeof(T))
+
+  IEnumerable<T> ResolveAll<T>()
+    → (IEnumerable<T>?) Resolve(typeof(IEnumerable<T>)) ?? Enumerable.Empty<T>()
+
+  IContainerScope CreateScope(IContainer container)
+    → ((IScopeFactory) container.ResolveRequired<IScopeFactory>()).CreateScope()
+
+
+================================================================================
+SECTION 7 — FILE STRUCTURE
+================================================================================
+
+DIcontainer_study/
+├── Attributes/
+│   └── InjectAttribute.cs
+├── Abstractions/
+│   ├── IServiceRegistry.cs
+│   ├── IContainer.cs
+│   ├── IContainerScope.cs
+│   └── IScopeFactory.cs
+├── ServiceLifetime.cs
+├── ServiceDescriptor.cs
+├── ServiceRegistry.cs
+├── Container.cs
+├── ScopedContainer.cs
+├── ContainerScope.cs
+├── Extensions/
+│   ├── ServiceRegistryExtensions.cs
+│   └── ContainerExtensions.cs
+└── Program.cs
+
+
+================================================================================
+SECTION 8 — DEMO IN Program.cs
+================================================================================
+
+Define demo services:
+
+  interface ILogger
+  class ConsoleLogger : ILogger
+    - Constructor: ()
+    - Logs to Console with a unique instance ID (Guid) so we can tell instances apart
+
+  interface IMessageService
+  class EmailMessageService : IMessageService
+    - Constructor: (ILogger logger)
+    - Has one [Inject] property: public ILogger SecondaryLogger { get; set; }
+
+  interface IRequestHandler
+  class RequestHandler : IRequestHandler
+    - Constructor: (IMessageService messages, ILogger logger)
+
+Registration:
+  var registry = new ServiceRegistry();
+  registry.AddSingleton<ILogger, ConsoleLogger>();
+  registry.AddTransient<IMessageService, EmailMessageService>();
+  registry.AddScoped<IRequestHandler, RequestHandler>();
+  var container = registry.BuildContainer();
+
+Demonstrate Singleton (same instance, same ID):
+  var log1 = container.ResolveRequired<ILogger>();
+  var log2 = container.ResolveRequired<ILogger>();
+  Assert ReferenceEquals(log1, log2) == true
+
+Demonstrate Transient (different instances, different IDs):
+  var msg1 = container.ResolveRequired<IMessageService>();
+  var msg2 = container.ResolveRequired<IMessageService>();
+  Assert ReferenceEquals(msg1, msg2) == false
+
+Demonstrate Property Injection:
+  var msg = (EmailMessageService) container.ResolveRequired<IMessageService>();
+  Assert msg.SecondaryLogger != null
+  Assert ReferenceEquals(msg.SecondaryLogger, log1) == true  (singleton)
+
+Demonstrate Scoped (same within scope, different across scopes):
+  using var scope1 = container.CreateScope();
+  using var scope2 = container.CreateScope();
+  var h1a = scope1.Container.ResolveRequired<IRequestHandler>();
+  var h1b = scope1.Container.ResolveRequired<IRequestHandler>();
+  var h2  = scope2.Container.ResolveRequired<IRequestHandler>();
+  Assert ReferenceEquals(h1a, h1b) == true   (same scope, same instance)
+  Assert ReferenceEquals(h1a, h2)  == false  (different scope)
+
+Demonstrate Captive Dependency Guard:
+  Try: container.ResolveRequired<IRequestHandler>()  — must throw
+
+Demonstrate Circular Dependency Detection:
+  Register a class Circular whose constructor takes Circular.
+  Try: container.ResolveRequired<Circular>()  — must throw with clear message
+
+Demonstrate IEnumerable<T> resolution:
+  Register two ILogger implementations.
+  var loggers = container.ResolveAll<ILogger>();
+  Assert loggers.Count() == 2
+
+Demonstrate IDisposable cleanup:
+  Have ConsoleLogger implement IDisposable and print "Disposed" in Dispose().
+  Wrap a scope in using; verify Dispose is called when scope ends.
+  Dispose the root container; verify singleton disposables are cleaned up.
+
+
+================================================================================
+SECTION 9 — ERROR HANDLING CONTRACT
+================================================================================
+
+ArgumentNullException:
+  - Null ServiceDescriptor passed to registry
+  - Null type or instance passed to extension methods
+
+InvalidOperationException:
+  - Circular dependency detected (include type name in message)
+  - ResolveRequired cannot find a registration
+  - Scoped service resolved from root container (captive dependency guard)
+  - No public constructor on implementation type
+  - Constructor or [Inject] property parameter cannot be resolved
+  - [Inject] applied to a property without a public setter
+
+ObjectDisposedException:
+  - Resolve called on a disposed Container or ScopedContainer
+
+
+================================================================================
+SECTION 10 — OUT OF SCOPE
+================================================================================
+
+The following are explicitly NOT implemented in this project:
+  - Open generic registrations (e.g. IRepository<T>)
+  - Named / keyed services
+  - Method injection
+  - Thread safety / concurrent access
+  - Conditional registrations (TryAdd semantics)
+  - Decorator pattern support
+  - Lazy<T> resolution
+
+================================================================================
+END OF PLAN
+================================================================================
