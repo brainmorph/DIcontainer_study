@@ -1,23 +1,13 @@
 namespace DIcontainer_study;
 
-public sealed class Container : IContainer, IScopeFactory, IDisposable
+internal sealed class ScopedContainer : IContainer, IDisposable
 {
-    private readonly Dictionary<Type, List<ServiceDescriptor>> _descriptors;
-    private readonly Dictionary<Type, object> _singletonCache = [];
+    private readonly Container _root;
+    private readonly Dictionary<Type, object> _scopedCache = [];
     private readonly List<IDisposable> _disposables = [];
     private bool _disposed;
 
-    public Container(IEnumerable<ServiceDescriptor> descriptors)
-    {
-        ArgumentNullException.ThrowIfNull(descriptors);
-        _descriptors = [];
-        foreach (var descriptor in descriptors)
-        {
-            if (!_descriptors.TryGetValue(descriptor.ServiceType, out var list))
-                _descriptors[descriptor.ServiceType] = list = [];
-            list.Add(descriptor);
-        }
-    }
+    internal ScopedContainer(Container root) => _root = root;
 
     public object? Resolve(Type serviceType)
     {
@@ -29,7 +19,7 @@ public sealed class Container : IContainer, IScopeFactory, IDisposable
     internal object? ResolveCore(Type serviceType, HashSet<Type> stack)
     {
         if (serviceType == typeof(IContainer)) return this;
-        if (serviceType == typeof(IScopeFactory)) return this;
+        if (serviceType == typeof(IScopeFactory)) return _root;
 
         if (serviceType.IsGenericType &&
             serviceType.GetGenericTypeDefinition() == typeof(IEnumerable<>))
@@ -37,28 +27,26 @@ public sealed class Container : IContainer, IScopeFactory, IDisposable
             return ResolveAll(serviceType.GetGenericArguments()[0], stack);
         }
 
-        var descriptor = GetLastDescriptor(serviceType);
+        var descriptor = _root.GetLastDescriptor(serviceType);
         return descriptor is null ? null : ResolveDescriptor(descriptor, stack);
     }
 
     private object ResolveDescriptor(ServiceDescriptor descriptor, HashSet<Type> stack)
         => descriptor.Lifetime switch
         {
-            ServiceLifetime.Singleton => ResolveSingleton(descriptor, stack),
+            ServiceLifetime.Singleton => _root.ResolveCore(descriptor.ServiceType, stack)!,
             ServiceLifetime.Transient => Instantiate(descriptor, stack),
-            ServiceLifetime.Scoped    => throw new InvalidOperationException(
-                $"Cannot resolve scoped service '{descriptor.ServiceType.Name}' from the root " +
-                "container. Use CreateScope() to obtain a scoped container."),
+            ServiceLifetime.Scoped    => ResolveScoped(descriptor, stack),
             _ => throw new InvalidOperationException($"Unknown lifetime: {descriptor.Lifetime}")
         };
 
-    private object ResolveSingleton(ServiceDescriptor descriptor, HashSet<Type> stack)
+    private object ResolveScoped(ServiceDescriptor descriptor, HashSet<Type> stack)
     {
-        if (_singletonCache.TryGetValue(descriptor.ServiceType, out var cached))
+        if (_scopedCache.TryGetValue(descriptor.ServiceType, out var cached))
             return cached;
 
         var instance = Instantiate(descriptor, stack);
-        _singletonCache[descriptor.ServiceType] = instance;
+        _scopedCache[descriptor.ServiceType] = instance;
         return instance;
     }
 
@@ -84,28 +72,15 @@ public sealed class Container : IContainer, IScopeFactory, IDisposable
 
     private object ResolveAll(Type elementType, HashSet<Type> stack)
     {
-        if (!_descriptors.TryGetValue(elementType, out var descriptors))
+        var allDescriptors = _root.GetAllDescriptors(elementType);
+        if (allDescriptors is null)
             return Array.CreateInstance(elementType, 0);
 
-        var array = Array.CreateInstance(elementType, descriptors.Count);
-        for (var i = 0; i < descriptors.Count; i++)
-            array.SetValue(ResolveDescriptor(descriptors[i], stack), i);
+        var array = Array.CreateInstance(elementType, allDescriptors.Count);
+        for (var i = 0; i < allDescriptors.Count; i++)
+            array.SetValue(ResolveDescriptor(allDescriptors[i], stack), i);
 
         return array;
-    }
-
-    internal ServiceDescriptor? GetLastDescriptor(Type serviceType)
-        => _descriptors.TryGetValue(serviceType, out var list) && list.Count > 0
-            ? list[^1]
-            : null;
-
-    internal List<ServiceDescriptor>? GetAllDescriptors(Type serviceType)
-        => _descriptors.TryGetValue(serviceType, out var list) ? list : null;
-
-    public IContainerScope CreateScope()
-    {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-        return new ContainerScope(this);
     }
 
     public void Dispose()
@@ -115,6 +90,6 @@ public sealed class Container : IContainer, IScopeFactory, IDisposable
         for (var i = _disposables.Count - 1; i >= 0; i--)
             _disposables[i].Dispose();
         _disposables.Clear();
-        _singletonCache.Clear();
+        _scopedCache.Clear();
     }
 }
