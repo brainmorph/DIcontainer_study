@@ -16,9 +16,36 @@ CONFIRMED DESIGN DECISIONS
 - Constructor pick:   Greedy — constructor with the most parameters wins
 - Thread safety:      None — single-threaded use only
 
+PROGRESS
+--------
+  [DONE] Section 1  — Core Value Types
+  [DONE] Section 2  — Abstractions
+  [DONE] Section 3  — Attributes
+  [DONE] Section 4  — Registration
+  [DONE] Section 5  — Resolution Engine
+  [ TODO ] Section 6  — Resolution Helpers (ContainerExtensions)
+  [ TODO ] Section 7  — File Structure (reference — update when done)
+  [ TODO ] Section 8  — Demo in Program.cs
+  [N/A ] Section 9  — Error Handling Contract (implemented inline in Sections 4–5)
+  [N/A ] Section 10 — Out of Scope (reference only)
+
+IMPLEMENTATION NOTES (deviations from original plan)
+-----------------------------------------------------
+- Injector.cs added (not in original plan): shared static helper containing
+  ConstructorInject and PropertyInject logic. Both Container and ScopedContainer
+  delegate to it via a resolver Func<Type, HashSet<Type>, object?> to avoid
+  code duplication while keeping each class's own resolution context.
+- ScopedContainer and ContainerScope are internal sealed (plan did not specify
+  visibility). Users interact with them only through IContainer and IContainerScope.
+- PropertyInject is always called after construction regardless of whether the
+  instance came from a factory or reflection (plan implied factory-only; bug
+  caught and fixed during implementation).
+- Section 3 (Attributes) and Section 5 (Resolution Engine) were built together
+  in one session since [Inject] is only meaningful in the context of the engine.
+
 
 ================================================================================
-SECTION 1 — CORE VALUE TYPES
+SECTION 1 — CORE VALUE TYPES                                           [DONE]
 ================================================================================
 
 ServiceLifetime  (enum)
@@ -51,7 +78,7 @@ ServiceDescriptor  (class, immutable after construction)
 
 
 ================================================================================
-SECTION 2 — ABSTRACTIONS (Interfaces)
+SECTION 2 — ABSTRACTIONS (Interfaces)                                  [DONE]
 ================================================================================
 
 IServiceRegistry  (extends IList<ServiceDescriptor>)
@@ -60,7 +87,7 @@ IServiceRegistry  (extends IList<ServiceDescriptor>)
 
 IContainer  (our equivalent of IServiceProvider — do NOT reuse System.IServiceProvider)
   object? Resolve(Type serviceType)
-  Note: also expose typed extension methods via ContainerExtensions (Section 5).
+  Note: also expose typed extension methods via ContainerExtensions (Section 6).
 
 IContainerScope  (our equivalent of IServiceScope)
   IContainer Container { get; }
@@ -71,7 +98,7 @@ IScopeFactory  (our equivalent of IServiceScopeFactory)
 
 
 ================================================================================
-SECTION 3 — ATTRIBUTES
+SECTION 3 — ATTRIBUTES                                                  [DONE]
 ================================================================================
 
 [Inject]  (custom attribute, inherits from Attribute)
@@ -81,7 +108,7 @@ SECTION 3 — ATTRIBUTES
 
 
 ================================================================================
-SECTION 4 — REGISTRATION
+SECTION 4 — REGISTRATION                                                [DONE]
 ================================================================================
 
 ServiceRegistry  (implements IServiceRegistry, extends List<ServiceDescriptor>)
@@ -115,7 +142,7 @@ ServiceRegistryExtensions  (static class)
 
 
 ================================================================================
-SECTION 5 — RESOLUTION ENGINE
+SECTION 5 — RESOLUTION ENGINE                                           [DONE]
 ================================================================================
 
 --- 5a. Container (root, implements IContainer, IScopeFactory, IDisposable) ---
@@ -151,8 +178,9 @@ SECTION 5 — RESOLUTION ENGINE
   Instantiate(ServiceDescriptor desc, HashSet<Type> stack) → object:
     Priority order:
       1. desc.Instance is set         → return it directly (no injection needed)
-      2. desc.Factory is set          → invoke factory(this); then do property injection
-      3. desc.ImplementationType set  → use constructor + property injection (see 5b)
+      2. desc.Factory is set          → invoke factory(this)
+      3. desc.ImplementationType set  → ConstructorInject via Injector
+    Always after 2 or 3: PropertyInject via Injector
     After creation, if object implements IDisposable → add to disposables list.
 
   CreateScope() → IContainerScope  (from IScopeFactory):
@@ -164,83 +192,62 @@ SECTION 5 — RESOLUTION ENGINE
     Set a disposed flag; throw ObjectDisposedException on subsequent Resolve calls.
 
 
---- 5b. Reflection-based instantiation ---
+--- 5b. Injector (internal static helper — not in original plan) ---
 
-  ConstructorInject(Type implType, HashSet<Type> stack) → object:
+  ConstructorInject(Type implType, HashSet<Type> stack, Func<Type,HashSet<Type>,object?> resolve):
     a. Get all public constructors via Type.GetConstructors().
     b. If none → throw InvalidOperationException("No public constructor on {implType}.")
     c. Sort by parameter count descending; take the first (greedy).
     d. Circular dependency check:
-         If implType is already in stack →
-           throw InvalidOperationException(
-             "Circular dependency detected: {implType} depends on itself.")
+         If implType is already in stack → throw InvalidOperationException
          Else → stack.Add(implType)
     e. For each constructor parameter:
-         resolved = Resolve(paramType) using the current stack
-         If resolved is null →
-           throw InvalidOperationException(
-             "Cannot resolve constructor parameter '{paramName}' of type '{paramType}'
-              for '{implType}'.")
+         resolved = resolve(paramType, stack)
+         If resolved is null → throw InvalidOperationException
     f. stack.Remove(implType)
     g. Return Activator.CreateInstance(implType, resolvedArgs[])
 
-  PropertyInject(object instance, HashSet<Type> stack):
-    a. Get all public properties on instance.GetType() where:
-         - Has [Inject] attribute
-         - Has a public setter
-    b. For each such property:
-         resolved = Resolve(property.PropertyType) using the current stack
-         If resolved is null →
-           throw InvalidOperationException(
-             "Cannot resolve [Inject] property '{propName}' of type '{propType}'
-              on '{implType}'.")
-         property.SetValue(instance, resolved)
-
-  Combined factory for ImplementationType:
-    obj = ConstructorInject(implType, stack)
-    PropertyInject(obj, stack)
-    return obj
+  PropertyInject(object instance, HashSet<Type> stack, Func<Type,HashSet<Type>,object?> resolve):
+    a. Get all public properties where [Inject] attribute is present.
+    b. For each: verify public setter exists or throw InvalidOperationException.
+    c. resolved = resolve(property.PropertyType, stack)
+       If resolved is null → throw InvalidOperationException
+    d. property.SetValue(instance, resolved)
 
 
 --- 5c. IEnumerable<T> resolution ---
 
   When Resolve receives a type of IEnumerable<T>:
     Look up all descriptors registered under T (not just the last one).
-    For each descriptor, call ResolveDescriptor (or retrieve from singleton cache).
-    Collect results and return as a T[] (which satisfies IEnumerable<T>).
+    For each descriptor, call ResolveDescriptor.
+    Collect results and return as a T[].
 
 
---- 5d. ScopedContainer (implements IContainer, IDisposable) ---
+--- 5d. ScopedContainer (internal, implements IContainer, IDisposable) ---
 
   Purpose: wraps the root Container; adds its own cache for Scoped instances.
 
   Constructor:
-    Accepts root Container (stored as internal reference, NOT exposed publicly).
-    Initializes scoped cache:      Dictionary<Type, object>
+    Accepts root Container (internal reference, not exposed publicly).
+    Initializes scoped cache:       Dictionary<Type, object>
     Initializes scoped disposables: List<IDisposable>
-    Disposed flag: false.
 
   Resolve(Type serviceType):
-    1. If serviceType == typeof(IContainer)    → return this (scoped container)
-    2. If serviceType == typeof(IScopeFactory) → return root.CreateScope factory
-    3. If serviceType is IEnumerable<T>        → delegate to root's multi-resolve,
-                                                  but Scoped instances use this scope's cache
+    1. IContainer    → return this
+    2. IScopeFactory → return root (so CreateScope branches from root)
+    3. IEnumerable<T> → resolve all via own resolver, routing by lifetime
     4. Look up last descriptor via root's internal descriptor map.
     5. If not found → return null.
-    6. Lifetime == Singleton  → delegate entirely to root (it owns the singleton cache)
-    7. Lifetime == Transient  → create via root's Instantiate; if IDisposable,
-                                  add to scoped disposables (not root)
-    8. Lifetime == Scoped     → check scoped cache; if hit return it.
-                                  Otherwise create via root's Instantiate,
-                                  store in scoped cache, track IDisposable.
+    6. Singleton  → delegate to root.ResolveCore (root owns the singleton cache)
+    7. Transient  → own Instantiate; track IDisposable in own disposables
+    8. Scoped     → check scoped cache; own Instantiate if miss, cache result
 
   Dispose():
     Dispose all scoped disposables in reverse order.
-    Clear scoped cache.
-    Set disposed flag; throw ObjectDisposedException on subsequent Resolve calls.
+    Clear scoped cache. Set disposed flag.
 
 
---- 5e. ContainerScope (implements IContainerScope, IDisposable) ---
+--- 5e. ContainerScope (internal, implements IContainerScope, IDisposable) ---
 
   Properties:
     IContainer Container  →  the ScopedContainer for this scope
@@ -253,7 +260,7 @@ SECTION 5 — RESOLUTION ENGINE
 
 
 ================================================================================
-SECTION 6 — RESOLUTION HELPERS
+SECTION 6 — RESOLUTION HELPERS                                         [ TODO ]
 ================================================================================
 
 ContainerExtensions  (static class, extension methods on IContainer)
@@ -278,7 +285,7 @@ ContainerExtensions  (static class, extension methods on IContainer)
 
 
 ================================================================================
-SECTION 7 — FILE STRUCTURE
+SECTION 7 — FILE STRUCTURE                                             [ TODO ]
 ================================================================================
 
 DIcontainer_study/
@@ -292,17 +299,18 @@ DIcontainer_study/
 ├── ServiceLifetime.cs
 ├── ServiceDescriptor.cs
 ├── ServiceRegistry.cs
+├── Injector.cs                  ← added during implementation
 ├── Container.cs
 ├── ScopedContainer.cs
 ├── ContainerScope.cs
 ├── Extensions/
 │   ├── ServiceRegistryExtensions.cs
-│   └── ContainerExtensions.cs
-└── Program.cs
+│   └── ContainerExtensions.cs   ← Section 6 TODO
+└── Program.cs                   ← Section 8 TODO
 
 
 ================================================================================
-SECTION 8 — DEMO IN Program.cs
+SECTION 8 — DEMO IN Program.cs                                         [ TODO ]
 ================================================================================
 
 Define demo services:
@@ -371,8 +379,10 @@ Demonstrate IDisposable cleanup:
 
 
 ================================================================================
-SECTION 9 — ERROR HANDLING CONTRACT
+SECTION 9 — ERROR HANDLING CONTRACT                                    [N/A]
 ================================================================================
+
+Implemented inline during Sections 4–5. Reproduced here for reference.
 
 ArgumentNullException:
   - Null ServiceDescriptor passed to registry
@@ -391,7 +401,7 @@ ObjectDisposedException:
 
 
 ================================================================================
-SECTION 10 — OUT OF SCOPE
+SECTION 10 — OUT OF SCOPE                                              [N/A]
 ================================================================================
 
 The following are explicitly NOT implemented in this project:
