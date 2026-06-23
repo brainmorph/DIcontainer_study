@@ -23,9 +23,9 @@ PROGRESS
   [DONE] Section 3  — Attributes
   [DONE] Section 4  — Registration
   [DONE] Section 5  — Resolution Engine
-  [ TODO ] Section 6  — Resolution Helpers (ContainerExtensions)
-  [ TODO ] Section 7  — File Structure (reference — update when done)
-  [ TODO ] Section 8  — Demo in Program.cs
+  [DONE] Section 6  — Resolution Helpers (ContainerExtensions)
+  [DONE] Section 7  — File Structure (reference — update when done)
+  [DONE] Section 8  — Demo in Program.cs
   [N/A ] Section 9  — Error Handling Contract (implemented inline in Sections 4–5)
   [N/A ] Section 10 — Out of Scope (reference only)
 
@@ -42,6 +42,8 @@ IMPLEMENTATION NOTES (deviations from original plan)
   caught and fixed during implementation).
 - Section 3 (Attributes) and Section 5 (Resolution Engine) were built together
   in one session since [Inject] is only meaningful in the context of the engine.
+- IContainer extended with IDisposable (not in original plan): needed so callers
+  can dispose the container through the interface without casting to a concrete type.
 
 
 ================================================================================

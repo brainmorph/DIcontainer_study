@@ -58,3 +58,4 @@ nunit-*.xml
 
 # Local dev context — never push
 claude_tools.txt
+test_context.txt
